@@ -1,0 +1,356 @@
+//@version=5
+strategy("Smart Options Strategy v1.0",
+         overlay         = true,
+         default_qty_type  = strategy.percent_of_equity,
+         default_qty_value = 2,
+         commission_type   = strategy.commission.percent,
+         commission_value  = 0.1,
+         max_labels_count  = 500,
+         max_lines_count   = 500)
+
+// ══════════════════════════════════════════════════════════════════════
+//  INPUTS
+// ══════════════════════════════════════════════════════════════════════
+
+// Risk Management
+i_atrLen   = input.int  (14,  "ATR Length",            minval=5,            group="Risk Management")
+i_atrMult  = input.float(1.5, "ATR Stop Multiplier",   minval=0.5, step=0.1, group="Risk Management")
+i_rrRatio  = input.float(3.0, "Risk : Reward Ratio",   minval=1.0, step=0.5, group="Risk Management")
+
+// Win-Rate Filter
+i_minWR    = input.float(50.0, "Min Win Rate % to Trade", minval=0, maxval=100, group="Win-Rate Filter")
+i_wrLB     = input.int  (20,   "Lookback (# trades)",     minval=5, maxval=100,  group="Win-Rate Filter")
+
+// Market Direction (broad market)
+i_mktSym   = input.symbol   ("SPY",  "Market Index",      group="Market Direction")
+i_mktTF    = input.timeframe("D",    "Market Timeframe",  group="Market Direction")
+i_mktFast  = input.int(20, "Market Fast EMA", group="Market Direction")
+i_mktSlow  = input.int(50, "Market Slow EMA", group="Market Direction")
+
+// Entry Checklist – EMAs
+i_emaFast  = input.int( 9,  "Fast EMA",  group="Entry Checklist")
+i_emaMid   = input.int(21,  "Mid EMA",   group="Entry Checklist")
+i_emaSlow  = input.int(50,  "Slow EMA",  group="Entry Checklist")
+// Entry Checklist – RSI
+i_rsiLen   = input.int  (14, "RSI Length",        group="Entry Checklist")
+i_rsiBull  = input.int  (55, "RSI Bull Floor",    group="Entry Checklist")
+i_rsiBear  = input.int  (45, "RSI Bear Ceiling",  group="Entry Checklist")
+// Entry Checklist – Volume
+i_volMult  = input.float(1.2, "Volume vs Avg (multiplier)", minval=1.0, step=0.1, group="Entry Checklist")
+i_volLen   = input.int  (20,  "Volume Avg Length",           group="Entry Checklist")
+// Entry Checklist – MACD
+i_macdF    = input.int(12, "MACD Fast",   group="Entry Checklist")
+i_macdS    = input.int(26, "MACD Slow",   group="Entry Checklist")
+i_macdSig  = input.int( 9, "MACD Signal", group="Entry Checklist")
+// Entry Checklist – minimum checks needed (out of 6)
+i_minChecks = input.int(5, "Min Checks Required (of 6)", minval=3, maxval=6, group="Entry Checklist")
+
+// Options / Stock Mode
+i_ownStock = input.bool(false, "I Own This Stock (enables CC / CSP mode)", group="Options Mode")
+
+// Market Profile
+i_showMP   = input.bool(true, "Show Profile Lines", group="Market Profile")
+i_mpLB     = input.int (20,   "Profile Lookback (bars)", minval=5, maxval=200, group="Market Profile")
+
+// ══════════════════════════════════════════════════════════════════════
+//  CORE INDICATORS
+// ══════════════════════════════════════════════════════════════════════
+
+atr    = ta.atr(i_atrLen)
+ema9   = ta.ema(close, i_emaFast)
+ema21  = ta.ema(close, i_emaMid)
+ema50  = ta.ema(close, i_emaSlow)
+rsi    = ta.rsi(close, i_rsiLen)
+avgVol = ta.sma(volume, i_volLen)
+
+[macdLine, sigLine, macdHist] = ta.macd(close, i_macdF, i_macdS, i_macdSig)
+
+// ── Broad Market ──────────────────────────────────────────────────────
+mktClose = request.security(i_mktSym, i_mktTF, close)
+mktEmaF  = request.security(i_mktSym, i_mktTF, ta.ema(close, i_mktFast))
+mktEmaS  = request.security(i_mktSym, i_mktTF, ta.ema(close, i_mktSlow))
+
+mktBull = mktEmaF > mktEmaS and mktClose > mktEmaF
+mktBear = mktEmaF < mktEmaS and mktClose < mktEmaF
+mktDir  = mktBull ? "BULLISH" : mktBear ? "BEARISH" : "NEUTRAL"
+
+// ── Simplified Market Profile ─────────────────────────────────────────
+// Value Area  ≈ 70 % of range around VWAP-approximated POC
+vwapLine  = ta.vwap(hlc3)
+phigh     = ta.highest(high, i_mpLB)
+plow      = ta.lowest (low,  i_mpLB)
+rangeSize = phigh - plow
+poc       = vwapLine                              // VWAP as POC proxy
+vah       = poc + rangeSize * 0.35               // ~70 % value area
+val       = poc - rangeSize * 0.35
+
+aboveVAH  = close > vah
+belowVAL  = close < val
+inVA      = close >= val and close <= vah
+
+// ══════════════════════════════════════════════════════════════════════
+//  ENTRY CHECKLISTS  (6 items each)
+// ══════════════════════════════════════════════════════════════════════
+
+// ── Bullish ───────────────────────────────────────────────────────────
+b1_ema    = close > ema9 and ema9 > ema21 and ema21 > ema50    // aligned EMA stack
+b2_rsi    = rsi >= i_rsiBull and rsi < 70                       // RSI momentum zone
+b3_vol    = volume > avgVol * i_volMult                         // above-average volume
+b4_macd   = macdLine > sigLine and macdHist > 0                 // MACD bullish
+b5_mkt    = mktBull                                              // broad market agrees
+b6_candle = close > open                                         // green candle
+
+bullScore  = (b1_ema ? 1 : 0) + (b2_rsi ? 1 : 0) + (b3_vol ? 1 : 0) +
+             (b4_macd ? 1 : 0) + (b5_mkt ? 1 : 0) + (b6_candle ? 1 : 0)
+bullSignal = bullScore >= i_minChecks
+
+// ── Bearish ───────────────────────────────────────────────────────────
+r1_ema    = close < ema9 and ema9 < ema21 and ema21 < ema50
+r2_rsi    = rsi <= i_rsiBear and rsi > 30
+r3_vol    = volume > avgVol * i_volMult
+r4_macd   = macdLine < sigLine and macdHist < 0
+r5_mkt    = mktBear
+r6_candle = close < open
+
+bearScore  = (r1_ema ? 1 : 0) + (r2_rsi ? 1 : 0) + (r3_vol ? 1 : 0) +
+             (r4_macd ? 1 : 0) + (r5_mkt ? 1 : 0) + (r6_candle ? 1 : 0)
+bearSignal = bearScore >= i_minChecks
+
+// ══════════════════════════════════════════════════════════════════════
+//  WIN-RATE TRACKER
+// ══════════════════════════════════════════════════════════════════════
+
+var float[] results     = array.new_float(0)
+var int     closedTrack = 0
+
+if strategy.closedtrades > closedTrack
+    pnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    array.push(results, pnl > 0 ? 1.0 : 0.0)
+    if array.size(results) > i_wrLB
+        array.shift(results)
+    closedTrack := strategy.closedtrades
+
+n          = array.size(results)
+winRate    = n > 0 ? array.sum(results) / n * 100 : 100.0
+// Allow trades until we have at least 5 samples; then enforce the threshold
+wrQual     = n < 5 or winRate >= i_minWR
+
+// ══════════════════════════════════════════════════════════════════════
+//  STOP LOSS & TAKE PROFIT  (3:1 RR default)
+// ══════════════════════════════════════════════════════════════════════
+
+slDistBull = atr * i_atrMult
+tpDistBull = slDistBull * i_rrRatio
+bullSL     = close - slDistBull
+bullTP     = close + tpDistBull
+
+slDistBear = atr * i_atrMult
+tpDistBear = slDistBear * i_rrRatio
+bearSL     = close + slDistBear
+bearTP     = close - tpDistBear
+
+// ══════════════════════════════════════════════════════════════════════
+//  OPTIONS RECOMMENDATION
+// ══════════════════════════════════════════════════════════════════════
+
+optionRec(isBull) =>
+    if i_ownStock
+        isBull ? "► COVERED CALL (CC)" : "► CASH SECURED PUT (CSP)"
+    else
+        isBull ? "► BUY CALLS" : "► BUY PUTS"
+
+// ══════════════════════════════════════════════════════════════════════
+//  STRATEGY ENTRIES / EXITS
+// ══════════════════════════════════════════════════════════════════════
+
+// Require price on correct side of POC as extra market-profile filter
+bullEntry = bullSignal and wrQual and close > poc and strategy.position_size == 0
+bearEntry = bearSignal and wrQual and close < poc and strategy.position_size == 0
+
+if bullEntry
+    strategy.entry("Long",  strategy.long)
+    strategy.exit ("LX",    "Long",  stop=bullSL, limit=bullTP)
+
+if bearEntry
+    strategy.entry("Short", strategy.short)
+    strategy.exit ("SX",    "Short", stop=bearSL, limit=bearTP)
+
+// ══════════════════════════════════════════════════════════════════════
+//  PLOTS – EMAs & Profile Levels
+// ══════════════════════════════════════════════════════════════════════
+
+plot(ema9,  "EMA 9",  color=color.new(color.yellow, 0), linewidth=1)
+plot(ema21, "EMA 21", color=color.new(color.orange, 0), linewidth=1)
+plot(ema50, "EMA 50", color=color.new(color.red,    0), linewidth=2)
+
+plot(i_showMP ? poc : na, "POC",  color=color.white,                linewidth=1)
+plot(i_showMP ? vah : na, "VAH",  color=color.new(color.green, 20), linewidth=1, style=plot.style_linebr)
+plot(i_showMP ? val : na, "VAL",  color=color.new(color.red,   20), linewidth=1, style=plot.style_linebr)
+
+// Soft background tint showing broad market bias
+bgcolor(mktBull ? color.new(color.green, 93) : mktBear ? color.new(color.red, 93) : na,
+        title="Market Direction Tint")
+
+// ══════════════════════════════════════════════════════════════════════
+//  SIGNAL LABELS
+// ══════════════════════════════════════════════════════════════════════
+
+if bullEntry
+    label.new(bar_index, low - atr,
+              "▲ BULL ENTRY\n" +
+              optionRec(true)  + "\n" +
+              "Checks : " + str.tostring(bullScore) + "/6\n" +
+              "WinRate: " + str.tostring(winRate, "#.1") + "%\n" +
+              "SL  : "    + str.tostring(bullSL,  format.mintick) + "\n" +
+              "TP  : "    + str.tostring(bullTP,  format.mintick),
+              color     = color.new(color.green, 5),
+              textcolor = color.white,
+              style     = label.style_label_up,
+              size      = size.normal)
+
+if bearEntry
+    label.new(bar_index, high + atr,
+              "▼ BEAR ENTRY\n" +
+              optionRec(false) + "\n" +
+              "Checks : " + str.tostring(bearScore) + "/6\n" +
+              "WinRate: " + str.tostring(winRate, "#.1") + "%\n" +
+              "SL  : "    + str.tostring(bearSL,  format.mintick) + "\n" +
+              "TP  : "    + str.tostring(bearTP,  format.mintick),
+              color     = color.new(color.red, 5),
+              textcolor = color.white,
+              style     = label.style_label_down,
+              size      = size.normal)
+
+// ══════════════════════════════════════════════════════════════════════
+//  DASHBOARD  (top-right table, updates on every bar)
+// ══════════════════════════════════════════════════════════════════════
+
+GRAY   = color.new(color.gray,  60)
+DGRAY  = color.new(color.gray,  80)
+GREEN  = color.new(color.green,  0)
+RED    = color.new(color.red,    0)
+ORANGE = color.new(color.orange, 0)
+BLUE   = color.new(color.blue,  30)
+PURPLE = color.new(color.purple, 0)
+NAVY   = color.new(#0d1b2e,     0)
+
+// helper: colour a boolean cell
+cellBG(cond) => cond ? GREEN : RED
+tick(cond)   => cond ? "✓" : "✗"
+
+var table db = table.new(position.top_right, 2, 26,
+                          border_color=color.new(color.gray, 40), border_width=1,
+                          frame_color =color.new(color.gray, 40), frame_width=1)
+
+if barstate.islast
+    // ── Header ──────────────────────────────────────────────────────
+    table.cell(db, 0, 0, "SMART OPTIONS STRATEGY",
+               text_color=color.white, bgcolor=NAVY, text_size=size.small)
+    table.cell(db, 1, 0, "v1.0",
+               text_color=color.white, bgcolor=NAVY, text_size=size.small)
+
+    // ── Market Direction ─────────────────────────────────────────────
+    mktClr = mktBull ? GREEN : mktBear ? RED : ORANGE
+    table.cell(db, 0, 1, "Market (" + i_mktSym + ")", text_color=color.white, bgcolor=DGRAY, text_size=size.small)
+    table.cell(db, 1, 1, mktDir,                       text_color=color.white, bgcolor=mktClr, text_size=size.small)
+
+    // ── Market Profile ───────────────────────────────────────────────
+    mpTxt = aboveVAH ? "Above VAH – Bullish" : belowVAL ? "Below VAL – Bearish" : "Inside Value Area"
+    mpClr = aboveVAH ? GREEN : belowVAL ? RED : ORANGE
+    table.cell(db, 0, 2, "Profile Zone",  text_color=color.white, bgcolor=DGRAY, text_size=size.small)
+    table.cell(db, 1, 2, mpTxt,           text_color=color.white, bgcolor=mpClr, text_size=size.small)
+
+    table.cell(db, 0, 3, "POC / VAH / VAL", text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 3,
+               str.tostring(poc, format.mintick) + "  /  " +
+               str.tostring(vah, format.mintick) + "  /  " +
+               str.tostring(val, format.mintick),
+               text_color=color.white, bgcolor=GRAY, text_size=size.tiny)
+
+    // ── Win Rate ─────────────────────────────────────────────────────
+    wrClr  = wrQual ? GREEN : RED
+    wrTxt  = str.tostring(winRate, "#.1") + "% (" + str.tostring(n) + " trades)"
+    table.cell(db, 0, 4, "Win Rate (≥" + str.tostring(i_minWR, "#") + "% req)", text_color=color.white, bgcolor=DGRAY, text_size=size.small)
+    table.cell(db, 1, 4, wrTxt + (wrQual ? " ✓" : " ✗"),                         text_color=color.white, bgcolor=wrClr, text_size=size.small)
+
+    // ── Risk : Reward ────────────────────────────────────────────────
+    table.cell(db, 0, 5, "Risk : Reward",                      text_color=color.white, bgcolor=DGRAY, text_size=size.small)
+    table.cell(db, 1, 5, "1 : " + str.tostring(i_rrRatio, "#.1"), text_color=color.white, bgcolor=BLUE, text_size=size.small)
+
+    // ── Trade Mode ───────────────────────────────────────────────────
+    modeTxt = i_ownStock ? "STOCK OWNER  →  CC / CSP" : "OPTIONS  →  Calls / Puts"
+    table.cell(db, 0, 6, "Trade Mode",  text_color=color.white, bgcolor=DGRAY,  text_size=size.small)
+    table.cell(db, 1, 6, modeTxt,       text_color=color.white, bgcolor=PURPLE, text_size=size.small)
+
+    // ── Active Recommendation ────────────────────────────────────────
+    recTxt = bullSignal and wrQual ? optionRec(true) :
+             bearSignal and wrQual ? optionRec(false) : "No Setup"
+    recClr = bullSignal and wrQual ? GREEN : bearSignal and wrQual ? RED : GRAY
+    table.cell(db, 0, 7, "Recommendation",  text_color=color.white, bgcolor=DGRAY,  text_size=size.small)
+    table.cell(db, 1, 7, recTxt,            text_color=color.white, bgcolor=recClr, text_size=size.small)
+
+    // ── Separator ────────────────────────────────────────────────────
+    table.cell(db, 0, 8, "── BULL CHECKLIST ──", text_color=color.white, bgcolor=color.new(color.green, 50), text_size=size.small)
+    table.cell(db, 1, 8, str.tostring(bullScore) + " / 6  " + (bullSignal ? "▲ READY" : "waiting"),
+               text_color=color.white, bgcolor=bullSignal ? GREEN : GRAY, text_size=size.small)
+
+    table.cell(db, 0,  9, "EMA Stack (9>21>50)",  text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1,  9, tick(b1_ema),            text_color=color.white, bgcolor=cellBG(b1_ema), text_size=size.tiny)
+    table.cell(db, 0, 10, "RSI ≥ " + str.tostring(i_rsiBull) + " (not overbought)", text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 10, tick(b2_rsi),            text_color=color.white, bgcolor=cellBG(b2_rsi), text_size=size.tiny)
+    table.cell(db, 0, 11, "Volume > avg × " + str.tostring(i_volMult, "#.1"), text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 11, tick(b3_vol),            text_color=color.white, bgcolor=cellBG(b3_vol), text_size=size.tiny)
+    table.cell(db, 0, 12, "MACD Bull (line>sig, hist>0)", text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 12, tick(b4_macd),           text_color=color.white, bgcolor=cellBG(b4_macd), text_size=size.tiny)
+    table.cell(db, 0, 13, "Market Bullish (" + i_mktSym + ")", text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 13, tick(b5_mkt),            text_color=color.white, bgcolor=cellBG(b5_mkt), text_size=size.tiny)
+    table.cell(db, 0, 14, "Green Candle",           text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 14, tick(b6_candle),          text_color=color.white, bgcolor=cellBG(b6_candle), text_size=size.tiny)
+
+    table.cell(db, 0, 15, "── BEAR CHECKLIST ──", text_color=color.white, bgcolor=color.new(color.red, 50), text_size=size.small)
+    table.cell(db, 1, 15, str.tostring(bearScore) + " / 6  " + (bearSignal ? "▼ READY" : "waiting"),
+               text_color=color.white, bgcolor=bearSignal ? RED : GRAY, text_size=size.small)
+
+    table.cell(db, 0, 16, "EMA Stack (9<21<50)",  text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 16, tick(r1_ema),            text_color=color.white, bgcolor=cellBG(r1_ema), text_size=size.tiny)
+    table.cell(db, 0, 17, "RSI ≤ " + str.tostring(i_rsiBear) + " (not oversold)", text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 17, tick(r2_rsi),            text_color=color.white, bgcolor=cellBG(r2_rsi), text_size=size.tiny)
+    table.cell(db, 0, 18, "Volume > avg × " + str.tostring(i_volMult, "#.1"), text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 18, tick(r3_vol),            text_color=color.white, bgcolor=cellBG(r3_vol), text_size=size.tiny)
+    table.cell(db, 0, 19, "MACD Bear (line<sig, hist<0)", text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 19, tick(r4_macd),           text_color=color.white, bgcolor=cellBG(r4_macd), text_size=size.tiny)
+    table.cell(db, 0, 20, "Market Bearish (" + i_mktSym + ")", text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 20, tick(r5_mkt),            text_color=color.white, bgcolor=cellBG(r5_mkt), text_size=size.tiny)
+    table.cell(db, 0, 21, "Red Candle",             text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 21, tick(r6_candle),          text_color=color.white, bgcolor=cellBG(r6_candle), text_size=size.tiny)
+
+    // ── Current Bar Info ─────────────────────────────────────────────
+    table.cell(db, 0, 22, "── CURRENT SETUP ──", text_color=color.white, bgcolor=NAVY, text_size=size.small)
+    table.cell(db, 1, 22, "",                     text_color=color.white, bgcolor=NAVY, text_size=size.small)
+    table.cell(db, 0, 23, "Stop Distance (ATR × " + str.tostring(i_atrMult, "#.1") + ")", text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 23, str.tostring(atr * i_atrMult, format.mintick), text_color=color.white, bgcolor=GRAY, text_size=size.tiny)
+    table.cell(db, 0, 24, "Bull  SL / TP",        text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 24,
+               str.tostring(bullSL, format.mintick) + "  /  " + str.tostring(bullTP, format.mintick),
+               text_color=color.white, bgcolor=GRAY, text_size=size.tiny)
+    table.cell(db, 0, 25, "Bear  SL / TP",        text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+    table.cell(db, 1, 25,
+               str.tostring(bearSL, format.mintick) + "  /  " + str.tostring(bearTP, format.mintick),
+               text_color=color.white, bgcolor=GRAY, text_size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════
+//  ALERTS
+// ══════════════════════════════════════════════════════════════════════
+
+alertcondition(bullEntry, "Bull Entry",
+               "▲ Bull Entry — {{ticker}} @ {{close}} | " +
+               "SL {{strategy.order.price}} | WinRate {{plot_0}}%")
+
+alertcondition(bearEntry, "Bear Entry",
+               "▼ Bear Entry — {{ticker}} @ {{close}} | " +
+               "SL {{strategy.order.price}} | WinRate {{plot_0}}%")
+
+alertcondition(bullEntry and i_ownStock, "CC Signal",    "► Sell Covered Call — {{ticker}}")
+alertcondition(bearEntry and i_ownStock, "CSP Signal",   "► Sell Cash-Secured Put — {{ticker}}")
+alertcondition(bullEntry and not i_ownStock, "Buy Call", "► Buy Calls — {{ticker}}")
+alertcondition(bearEntry and not i_ownStock, "Buy Put",  "► Buy Puts  — {{ticker}}")
