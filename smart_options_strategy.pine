@@ -1,5 +1,5 @@
 //@version=5
-strategy("Smart Options Strategy v1.0",
+strategy("Smart Options Strategy v1.1  [+VIX]",
          overlay         = true,
          default_qty_type  = strategy.percent_of_equity,
          default_qty_value = 2,
@@ -48,6 +48,11 @@ i_minChecks = input.int(5, "Min Checks Required (of 6)", minval=3, maxval=6, gro
 // Options / Stock Mode
 i_ownStock = input.bool(false, "I Own This Stock (enables CC / CSP mode)", group="Options Mode")
 
+// VIX
+i_vixSellThresh = input.float(25.0, "VIX ≥ this → Prefer Selling Premium", minval=15, maxval=60, step=1.0, group="VIX")
+i_vixBlockCalls = input.float(40.0, "VIX ≥ this → Block Raw Call Buying",  minval=20, maxval=80, step=1.0, group="VIX")
+i_showVIX       = input.bool (true,  "Show VIX Panel in Dashboard",                                          group="VIX")
+
 // Market Profile
 i_showMP   = input.bool(true, "Show Profile Lines", group="Market Profile")
 i_mpLB     = input.int (20,   "Profile Lookback (bars)", minval=5, maxval=200, group="Market Profile")
@@ -87,6 +92,31 @@ val       = poc - rangeSize * 0.35
 aboveVAH  = close > vah
 belowVAL  = close < val
 inVA      = close >= val and close <= vah
+
+// ── VIX – Volatility Regime ───────────────────────────────────────────
+vixLevel  = request.security("VIX", "D", close)
+vixPrev   = request.security("VIX", "D", close[1])
+
+vixRising  = vixLevel > vixPrev
+vixFalling = vixLevel < vixPrev
+
+vixCalm     = vixLevel < 15
+vixNormal   = vixLevel >= 15 and vixLevel < 20
+vixElevated = vixLevel >= 20 and vixLevel < 30
+vixHighFear = vixLevel >= 30
+
+vixRegimeTxt = vixHighFear ? "HIGH FEAR (≥30)"  :
+               vixElevated ? "ELEVATED (20-30)"  :
+               vixNormal   ? "NORMAL (15-20)"    :
+                             "CALM (<15)"
+
+// Directional edge: falling VIX → risk-on (bullish); rising VIX → risk-off (bearish)
+vixBullConf  = vixFalling                   // subsiding fear confirms longs
+vixBearConf  = vixRising                    // expanding fear confirms shorts
+
+// Options pricing logic
+vixPreferSell  = vixLevel >= i_vixSellThresh  // high IV → sell premium beats buying
+vixBlockRawCall = vixLevel >= i_vixBlockCalls  // extreme IV → block outright call buys
 
 // ══════════════════════════════════════════════════════════════════════
 //  ENTRY CHECKLISTS  (6 items each)
@@ -155,7 +185,15 @@ bearTP     = close - tpDistBear
 
 optionRec(isBull) =>
     if i_ownStock
+        // Owning stock: high VIX means MORE premium to collect → still CC/CSP
         isBull ? "► COVERED CALL (CC)" : "► CASH SECURED PUT (CSP)"
+    else if vixBlockRawCall and isBull
+        // VIX is extreme → raw calls are overpriced; use spread to cap premium paid
+        "► BULL CALL SPREAD (VIX EXTREME)"
+    else if vixPreferSell and isBull
+        "► BULL SPREAD / CC (VIX HIGH)"
+    else if vixPreferSell and not isBull
+        "► BEAR SPREAD / CSP (VIX HIGH)"
     else
         isBull ? "► BUY CALLS" : "► BUY PUTS"
 
@@ -164,7 +202,10 @@ optionRec(isBull) =>
 // ══════════════════════════════════════════════════════════════════════
 
 // Require price on correct side of POC as extra market-profile filter
-bullEntry = bullSignal and wrQual and close > poc and strategy.position_size == 0
+// Bull: block raw-call buys at extreme VIX unless user owns stock (CC fine at any VIX)
+vixBullGate = i_ownStock or not vixBlockRawCall
+bullEntry = bullSignal and wrQual and close > poc and vixBullGate and strategy.position_size == 0
+// Bear: rising VIX is a tailwind, not a blocker
 bearEntry = bearSignal and wrQual and close < poc and strategy.position_size == 0
 
 if bullEntry
@@ -201,6 +242,7 @@ if bullEntry
               optionRec(true)  + "\n" +
               "Checks : " + str.tostring(bullScore) + "/6\n" +
               "WinRate: " + str.tostring(winRate, "#.1") + "%\n" +
+              "VIX    : " + str.tostring(vixLevel, "#.1") + "  " + vixRegimeTxt + (vixFalling ? " ↓ ✓" : " ↑") + "\n" +
               "SL  : "    + str.tostring(bullSL,  format.mintick) + "\n" +
               "TP  : "    + str.tostring(bullTP,  format.mintick),
               color     = color.new(color.green, 5),
@@ -214,6 +256,7 @@ if bearEntry
               optionRec(false) + "\n" +
               "Checks : " + str.tostring(bearScore) + "/6\n" +
               "WinRate: " + str.tostring(winRate, "#.1") + "%\n" +
+              "VIX    : " + str.tostring(vixLevel, "#.1") + "  " + vixRegimeTxt + (vixRising ? " ↑ ✓" : " ↓") + "\n" +
               "SL  : "    + str.tostring(bearSL,  format.mintick) + "\n" +
               "TP  : "    + str.tostring(bearTP,  format.mintick),
               color     = color.new(color.red, 5),
@@ -238,7 +281,7 @@ NAVY   = color.new(#0d1b2e,     0)
 cellBG(cond) => cond ? GREEN : RED
 tick(cond)   => cond ? "✓" : "✗"
 
-var table db = table.new(position.top_right, 2, 26,
+var table db = table.new(position.top_right, 2, 32,
                           border_color=color.new(color.gray, 40), border_width=1,
                           frame_color =color.new(color.gray, 40), frame_width=1)
 
@@ -338,6 +381,43 @@ if barstate.islast
                str.tostring(bearSL, format.mintick) + "  /  " + str.tostring(bearTP, format.mintick),
                text_color=color.white, bgcolor=GRAY, text_size=size.tiny)
 
+    // ── VIX Panel ────────────────────────────────────────────────────
+    if i_showVIX
+        vixClr = vixHighFear ? color.new(color.maroon, 0) :
+                 vixElevated ? RED :
+                 vixNormal   ? ORANGE : GREEN
+
+        table.cell(db, 0, 26, "── VIX ──────────────────", text_color=color.white, bgcolor=color.new(color.teal, 40), text_size=size.small)
+        table.cell(db, 1, 26, "",                           text_color=color.white, bgcolor=color.new(color.teal, 40), text_size=size.small)
+
+        table.cell(db, 0, 27, "VIX Level", text_color=color.white, bgcolor=DGRAY, text_size=size.small)
+        table.cell(db, 1, 27, str.tostring(vixLevel, "#.2") + "  –  " + vixRegimeTxt,
+                   text_color=color.white, bgcolor=vixClr, text_size=size.small)
+
+        trendTxt = vixRising ? "↑ RISING  (bearish pressure)" : vixFalling ? "↓ FALLING  (risk-on)" : "→ FLAT"
+        trendClr = vixRising ? RED : vixFalling ? GREEN : GRAY
+        table.cell(db, 0, 28, "VIX Trend", text_color=color.white, bgcolor=DGRAY, text_size=size.small)
+        table.cell(db, 1, 28, trendTxt,    text_color=color.white, bgcolor=trendClr, text_size=size.small)
+
+        // Options pricing advice based on VIX
+        ivAdvice = vixBlockRawCall ? "EXTREME IV → Use Spreads Only" :
+                   vixPreferSell   ? "HIGH IV → Sell Premium / Spread" :
+                   vixNormal       ? "NORMAL IV → Calls/Puts OK" :
+                                     "LOW IV → Directional Buys Cheap"
+        ivClr    = vixBlockRawCall ? color.new(color.maroon, 0) :
+                   vixPreferSell   ? RED :
+                   vixNormal       ? BLUE : GREEN
+        table.cell(db, 0, 29, "IV / Options Advice", text_color=color.white, bgcolor=DGRAY, text_size=size.small)
+        table.cell(db, 1, 29, ivAdvice,              text_color=color.white, bgcolor=ivClr, text_size=size.small)
+
+        // VIX confirmation for current setup
+        bullVIXStr = vixBullConf ? "✓ VIX falling (bullish)" : "✗ VIX not confirming"
+        bearVIXStr = vixBearConf ? "✓ VIX rising (bearish)"  : "✗ VIX not confirming"
+        table.cell(db, 0, 30, "Bull VIX Conf", text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+        table.cell(db, 1, 30, bullVIXStr, text_color=color.white, bgcolor=cellBG(vixBullConf), text_size=size.tiny)
+        table.cell(db, 0, 31, "Bear VIX Conf", text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+        table.cell(db, 1, 31, bearVIXStr, text_color=color.white, bgcolor=cellBG(vixBearConf), text_size=size.tiny)
+
 // ══════════════════════════════════════════════════════════════════════
 //  ALERTS
 // ══════════════════════════════════════════════════════════════════════
@@ -354,3 +434,8 @@ alertcondition(bullEntry and i_ownStock, "CC Signal",    "► Sell Covered Call 
 alertcondition(bearEntry and i_ownStock, "CSP Signal",   "► Sell Cash-Secured Put — {{ticker}}")
 alertcondition(bullEntry and not i_ownStock, "Buy Call", "► Buy Calls — {{ticker}}")
 alertcondition(bearEntry and not i_ownStock, "Buy Put",  "► Buy Puts  — {{ticker}}")
+
+// VIX regime change alerts
+alertcondition(ta.crossover (vixLevel, 20), "VIX crossed above 20", "⚠ VIX > 20 — IV Elevated. Consider spreads over outright buys.")
+alertcondition(ta.crossover (vixLevel, 30), "VIX crossed above 30", "🚨 VIX > 30 — High Fear. Prefer selling premium (CSP / CC / Spreads).")
+alertcondition(ta.crossunder(vixLevel, 20), "VIX dropped below 20", "✅ VIX < 20 — IV normalizing. Directional buying viable again.")
