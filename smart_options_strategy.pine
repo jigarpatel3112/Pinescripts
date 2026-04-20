@@ -1,5 +1,5 @@
 //@version=5
-strategy("Smart Options Strategy v1.1  [+VIX]",
+strategy("Smart Options Strategy v1.2  [+VIX +Earnings]",
          overlay         = true,
          default_qty_type  = strategy.percent_of_equity,
          default_qty_value = 2,
@@ -53,6 +53,13 @@ i_vixSellThresh = input.float(25.0, "VIX ≥ this → Prefer Selling Premium", m
 i_vixBlockCalls = input.float(40.0, "VIX ≥ this → Block Raw Call Buying",  minval=20, maxval=80, step=1.0, group="VIX")
 i_showVIX       = input.bool (true,  "Show VIX Panel in Dashboard",                                          group="VIX")
 
+// Earnings Blackout
+i_earnBlackout  = input.int (5,    "Blackout Days Before Est. Earnings", minval=1, maxval=14,  group="Earnings")
+i_earnAfter     = input.int (2,    "Blackout Days After  Est. Earnings", minval=0, maxval=5,   group="Earnings")
+i_earnOverride  = input.bool(false,"Use Manual Earnings Date Override",                        group="Earnings")
+i_earnDate      = input.time(timestamp("2025-01-01"), "Manual Earnings Date (if override on)", group="Earnings")
+i_showEarn      = input.bool(true, "Show Earnings Panel in Dashboard",                         group="Earnings")
+
 // Market Profile
 i_showMP   = input.bool(true, "Show Profile Lines", group="Market Profile")
 i_mpLB     = input.int (20,   "Profile Lookback (bars)", minval=5, maxval=200, group="Market Profile")
@@ -92,6 +99,41 @@ val       = poc - rangeSize * 0.35
 aboveVAH  = close > vah
 belowVAL  = close < val
 inVA      = close >= val and close <= vah
+
+// ── Earnings Blackout ─────────────────────────────────────────────────
+// request.earnings() gives historical EPS releases; we use the most recent
+// date to estimate the next quarterly event (~91 calendar days later)
+earnDate    = request.earnings(syminfo.tickerid, earnings.actual,
+                               barmerge.gaps_on, barmerge.lookahead_off)
+
+// Walk back to find the most recent bar where an earnings value appeared
+var int   lastEarnBar  = na
+var float lastEarnVal  = na
+if not na(earnDate)
+    lastEarnBar := bar_index
+    lastEarnVal := earnDate
+
+// Convert bar index → approximate timestamp (ms) using bar's time
+// Then estimate next earnings ~91 calendar days (≈ 1 quarter) ahead
+msPerBar       = timeframe.in_seconds() * 1000
+lastEarnTime   = not na(lastEarnBar) ? time - (bar_index - lastEarnBar) * msPerBar : na
+estNextEarn    = not na(lastEarnTime) ? lastEarnTime + 91 * 86400000 : na   // +91 days in ms
+
+// If user toggled manual override, use their pinned date instead
+nextEarnTime   = i_earnOverride ? i_earnDate : estNextEarn
+
+// Days to next earnings (approximate; 1 trading day ≈ 6.5 h but we use calendar ms)
+daysToEarn     = not na(nextEarnTime) ? math.round((nextEarnTime - time) / 86400000) : na
+
+// Blackout: true when we are within the pre/post earnings window
+inBlackout     = not na(daysToEarn) and
+                 daysToEarn >= -i_earnAfter and
+                 daysToEarn <= i_earnBlackout
+
+// EPS context from last earnings (beat / miss)
+lastActual     = request.earnings(syminfo.tickerid, earnings.actual,   barmerge.gaps_on, barmerge.lookahead_off)
+lastEstimate   = request.earnings(syminfo.tickerid, earnings.estimate, barmerge.gaps_on, barmerge.lookahead_off)
+epsBeat        = not na(lastActual) and not na(lastEstimate) and lastActual >= lastEstimate
 
 // ── VIX – Volatility Regime ───────────────────────────────────────────
 vixLevel  = request.security("VIX", "D", close)
@@ -203,10 +245,11 @@ optionRec(isBull) =>
 
 // Require price on correct side of POC as extra market-profile filter
 // Bull: block raw-call buys at extreme VIX unless user owns stock (CC fine at any VIX)
+// Also block ALL entries during earnings blackout window
 vixBullGate = i_ownStock or not vixBlockRawCall
-bullEntry = bullSignal and wrQual and close > poc and vixBullGate and strategy.position_size == 0
-// Bear: rising VIX is a tailwind, not a blocker
-bearEntry = bearSignal and wrQual and close < poc and strategy.position_size == 0
+bullEntry = bullSignal and wrQual and close > poc and vixBullGate and not inBlackout and strategy.position_size == 0
+// Bear: rising VIX is a tailwind, not a blocker; still respect earnings blackout
+bearEntry = bearSignal and wrQual and close < poc and not inBlackout and strategy.position_size == 0
 
 if bullEntry
     strategy.entry("Long",  strategy.long)
@@ -243,6 +286,7 @@ if bullEntry
               "Checks : " + str.tostring(bullScore) + "/6\n" +
               "WinRate: " + str.tostring(winRate, "#.1") + "%\n" +
               "VIX    : " + str.tostring(vixLevel, "#.1") + "  " + vixRegimeTxt + (vixFalling ? " ↓ ✓" : " ↑") + "\n" +
+              "Earn   : " + (not na(daysToEarn) ? "~" + str.tostring(daysToEarn) + "d away" : "unknown") + "\n" +
               "SL  : "    + str.tostring(bullSL,  format.mintick) + "\n" +
               "TP  : "    + str.tostring(bullTP,  format.mintick),
               color     = color.new(color.green, 5),
@@ -257,6 +301,7 @@ if bearEntry
               "Checks : " + str.tostring(bearScore) + "/6\n" +
               "WinRate: " + str.tostring(winRate, "#.1") + "%\n" +
               "VIX    : " + str.tostring(vixLevel, "#.1") + "  " + vixRegimeTxt + (vixRising ? " ↑ ✓" : " ↓") + "\n" +
+              "Earn   : " + (not na(daysToEarn) ? "~" + str.tostring(daysToEarn) + "d away" : "unknown") + "\n" +
               "SL  : "    + str.tostring(bearSL,  format.mintick) + "\n" +
               "TP  : "    + str.tostring(bearTP,  format.mintick),
               color     = color.new(color.red, 5),
@@ -281,7 +326,7 @@ NAVY   = color.new(#0d1b2e,     0)
 cellBG(cond) => cond ? GREEN : RED
 tick(cond)   => cond ? "✓" : "✗"
 
-var table db = table.new(position.top_right, 2, 32,
+var table db = table.new(position.top_right, 2, 38,
                           border_color=color.new(color.gray, 40), border_width=1,
                           frame_color =color.new(color.gray, 40), frame_width=1)
 
@@ -418,6 +463,50 @@ if barstate.islast
         table.cell(db, 0, 31, "Bear VIX Conf", text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
         table.cell(db, 1, 31, bearVIXStr, text_color=color.white, bgcolor=cellBG(vixBearConf), text_size=size.tiny)
 
+    // ── Earnings Panel ───────────────────────────────────────────────
+    if i_showEarn
+        earnHdrClr = inBlackout ? color.new(color.maroon, 0) : color.new(color.teal, 40)
+        earnHdrTxt = inBlackout ? "── EARNINGS  ⚠ BLACKOUT ──" : "── EARNINGS ──────────────"
+        table.cell(db, 0, 32, earnHdrTxt, text_color=color.white, bgcolor=earnHdrClr, text_size=size.small)
+        table.cell(db, 1, 32, "",         text_color=color.white, bgcolor=earnHdrClr, text_size=size.small)
+
+        // Source label
+        srcTxt = i_earnOverride ? "Manual date pinned" : "Auto-estimated (+91d)"
+        table.cell(db, 0, 33, "Source",  text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+        table.cell(db, 1, 33, srcTxt,   text_color=color.white, bgcolor=GRAY,  text_size=size.tiny)
+
+        // Days to next earnings
+        earnDaysTxt = not na(daysToEarn) ?
+                      (daysToEarn < 0 ? str.tostring(math.abs(daysToEarn)) + "d ago" :
+                       str.tostring(daysToEarn) + "d away") : "No data"
+        earnDaysClr = not na(daysToEarn) and daysToEarn <= i_earnBlackout and daysToEarn >= 0 ?
+                      color.new(color.maroon, 0) :
+                      not na(daysToEarn) and daysToEarn <= 14 ? RED : GRAY
+        table.cell(db, 0, 34, "Est. Next Earnings", text_color=color.white, bgcolor=DGRAY,      text_size=size.small)
+        table.cell(db, 1, 34, earnDaysTxt,          text_color=color.white, bgcolor=earnDaysClr, text_size=size.small)
+
+        // Blackout status
+        blackoutTxt = inBlackout ? "🚫 BLOCKED — In Blackout Window" : "✓ Clear to Trade"
+        blackoutClr = inBlackout ? color.new(color.maroon, 0) : GREEN
+        table.cell(db, 0, 35, "Entry Gate",  text_color=color.white, bgcolor=DGRAY,      text_size=size.small)
+        table.cell(db, 1, 35, blackoutTxt,   text_color=color.white, bgcolor=blackoutClr, text_size=size.small)
+
+        // Last EPS beat / miss
+        epsTxt = not na(lastActual) ?
+                 (epsBeat ? "✓ BEAT  (" + str.tostring(lastActual, "#.##") + " vs " + str.tostring(lastEstimate, "#.##") + ")" :
+                            "✗ MISS  (" + str.tostring(lastActual, "#.##") + " vs " + str.tostring(lastEstimate, "#.##") + ")") :
+                 "No EPS data"
+        epsClr = not na(lastActual) ? (epsBeat ? GREEN : RED) : GRAY
+        table.cell(db, 0, 36, "Last EPS",  text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+        table.cell(db, 1, 36, epsTxt,      text_color=color.white, bgcolor=epsClr, text_size=size.tiny)
+
+        // Directional hint from last EPS
+        epsBiasTxt = not na(lastActual) ?
+                     (epsBeat ? "Beat → watch for post-earn bullish follow-through" :
+                                "Miss → watch for post-earn bearish continuation") : ""
+        table.cell(db, 0, 37, "EPS Bias",  text_color=color.white, bgcolor=DGRAY, text_size=size.tiny)
+        table.cell(db, 1, 37, epsBiasTxt,  text_color=color.white, bgcolor=GRAY,  text_size=size.tiny)
+
 // ══════════════════════════════════════════════════════════════════════
 //  ALERTS
 // ══════════════════════════════════════════════════════════════════════
@@ -436,6 +525,8 @@ alertcondition(bullEntry and not i_ownStock, "Buy Call", "► Buy Calls — {{ti
 alertcondition(bearEntry and not i_ownStock, "Buy Put",  "► Buy Puts  — {{ticker}}")
 
 // VIX regime change alerts
+alertcondition(inBlackout, "Earnings Blackout Active", "⚠ {{ticker}} — Earnings blackout window. Entries suppressed.")
+alertcondition(not na(daysToEarn) and daysToEarn == i_earnBlackout, "Earnings Warning", "📅 {{ticker}} — Estimated earnings in " + str.tostring(i_earnBlackout) + " days. Blackout starting.")
 alertcondition(ta.crossover (vixLevel, 20), "VIX crossed above 20", "⚠ VIX > 20 — IV Elevated. Consider spreads over outright buys.")
 alertcondition(ta.crossover (vixLevel, 30), "VIX crossed above 30", "🚨 VIX > 30 — High Fear. Prefer selling premium (CSP / CC / Spreads).")
 alertcondition(ta.crossunder(vixLevel, 20), "VIX dropped below 20", "✅ VIX < 20 — IV normalizing. Directional buying viable again.")
